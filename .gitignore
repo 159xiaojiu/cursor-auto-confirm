@@ -21,3 +21,8 @@ autopilot.pid
 tray.lock
 debug_*.png
 debug_*.ps1*
+
+# temp upload artifacts
+_push_*
+_batch_*
+_mcp_*
