@@ -1,0 +1,99 @@
+# Cursor 自动确认助手 配置文件
+# 改动后重启程序生效。所有按钮匹配大小写不敏感。
+
+scan:
+  # mode: windows = 逐个抓取每个 Cursor 窗口(支持后台/多窗口同时照看, 推荐)
+  #       screen  = 只扫当前屏幕可见画面(单窗口)
+  mode: windows
+  interval_seconds: 1.5     # 扫描间隔(秒)
+  monitor: 0                # [screen模式] 显示器序号: 0=全部拼合, 1=主显示器...
+  region: null              # [screen模式] 限定扫描区域 [left, top, width, height]
+  downscale: 1.0            # OCR 前缩放比例(<1 提速, 可能降准); 1.0=不缩放
+
+detection:
+  min_confidence: 0.35       # OCR 文本置信度下限(Composer 小按钮略低)
+  targets:
+    - "Accept All"
+    - "Keep All"
+    - "Accept"
+    - "Keep"
+    - "Run in background"
+    - "Run Command"
+    - "Run All"
+    - "Run"
+    - "Fetch"
+    - "Approve"
+    - "Allow"
+    - "Resume"
+    - "Continue generating"
+    - "Continue"
+    - "Try Again"
+    - "Retry"
+    - "Proceed"
+  # 黑名单: 命中则绝不点击(优先级高于 targets)
+  blacklist:
+    - "Use Allowlist"
+    - "Add to Allowlist"
+    - "Ask Every Time"
+    - "Reject All"
+    - "Reject"
+    - "Deny"
+    - "Undo"
+    - "Skip"
+
+safety:
+  enabled: true
+  # 这些按钮在点击前必须通过危险命令检查(读取按钮上方的命令文本)
+  command_buttons:
+    - "Run in background"
+    - "Run Command"
+    - "Run"
+    - "Approve"
+  command_lookup_height: 100   # 仅读按钮正上方约一行命令区, 避免聊天历史误拦
+  dangerous_patterns:
+    - "rm -rf"
+    - "del /s"
+    - "del /q"
+    - "rmdir /s"
+    - "format "
+    - "format c:"
+    - "mkfs"
+    - "diskpart"
+    - "dd if="
+    - "> /dev/sd"
+    - "shutdown"
+    - "reboot"
+    - "chmod -r 777"
+    - ":(){"
+    - "| sh"
+    - "| bash"
+    - "| iex"
+    - "iwr "
+    - "invoke-expression"
+    - "remove-item -recurse"
+    - "git push --force"
+    - "git push -f"
+    - "begin private key"
+    - "akia"
+    - ".ssh/id_"
+  death_loop:
+    window_seconds: 15         # 统计窗口(只把"短时间内反复点同一处"判为死循环)
+    max_clicks: 6              # 窗口内同一按钮点击上限, 超过则暂停告警
+    cooldown_seconds: 60       # 触发后的冷却暂停时长
+
+click:
+  restore_focus: true          # 点击后归还原前台窗口焦点
+  restore_mouse: true          # 点击后把鼠标移回原位置
+  pause_on_user_activity_seconds: 0   # 0=不暂停; >0 时仅当前台是 Cursor 且你在操作才暂停
+
+hotkey:
+  toggle: "ctrl+alt+a"         # 启停自动点击
+  quit: "ctrl+alt+q"           # 退出程序
+
+logging:
+  level: "INFO"
+  file: "logs/autopilot.log"
+
+watchdog:
+  enabled: true
+  interval_seconds: 300    # 每 5 分钟巡检 Agent 对话窗口状态

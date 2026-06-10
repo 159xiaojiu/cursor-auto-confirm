@@ -1,0 +1,23 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.pytest_cache/
+logs/
+*.log
+*.pid
+*.lock
+
+# Build artifacts
+build/
+dist/
+_internal/
+release/
+*.exe
+*.zip
+
+# Runtime / debug
+autopilot.pid
+tray.lock
+debug_*.png
+debug_*.ps1*
