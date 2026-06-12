@@ -177,24 +177,40 @@ class Orchestrator:
         return unique
 
     def _scan_window(self, win, *, force_refresh: bool = False):
-        from .windows import capture_window
+        from .windows import capture_window, is_composer_window, scroll_composer_to_bottom
+
+        if is_composer_window(win.title):
+            scroll_composer_to_bottom(win, force=force_refresh)
 
         refresh = force_refresh or win.title == "Cursor Agents"
         img = capture_window(win.hwnd, refresh_background=refresh)
         if img is None:
             log.debug("窗口 '%s' 截图失败", win.title)
             return [], []
+
+        cands, boxes = self._scan_image_regions(win, img)
+        if cands or not is_composer_window(win.title):
+            return cands, boxes
+
+        # 未找到按钮且聊天可能未滚到底: 强制滚到底后重扫一次
+        log.debug("窗口 '%s' 未发现按钮, 强制滚到底后重试", win.title)
+        scroll_composer_to_bottom(win, force=True)
+        time.sleep(0.15)
+        img2 = capture_window(win.hwnd, refresh_background=True)
+        if img2 is None:
+            return cands, boxes
+        return self._scan_image_regions(win, img2)
+
+    def _scan_image_regions(self, win, img):
         regions = self._scan_regions(win, img)
         if not regions:
             return [], []
 
-        # 阶段1: 只扫最下方一段(多数 Run/Fetch 在这)
         bottom = regions[-1]
         cands, boxes = self._ocr_region(win, bottom[0], bottom[1], bottom[2])
         if cands:
             return self._dedupe_candidates(cands), boxes
 
-        # 阶段2: 全区域扫描(聊天区中段按钮)
         all_cands: list = []
         all_boxes: list = []
         for region_img, y_off, x_off in regions:

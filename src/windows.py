@@ -151,7 +151,73 @@ def _capture_printwindow(hwnd: int) -> np.ndarray | None:
 
 
 _last_foreground_refresh: dict[int, float] = {}
+_last_composer_scroll: dict[int, float] = {}
 _FOREGROUND_REFRESH_COOLDOWN = 2.0
+_COMPOSER_SCROLL_COOLDOWN = 2.5
+
+
+def is_composer_window(title: str) -> bool:
+    """带 Agent/Composer 聊天区的窗口(需滚到底才能看到最新确认按钮)。"""
+    return title == "Cursor Agents" or title.endswith(" - Cursor")
+
+
+def _composer_click_point(win: CursorWindow) -> tuple[int, int]:
+    """Composer 聊天区内的点击坐标(用于聚焦并滚动)。"""
+    if win.title == "Cursor Agents":
+        cx = win.left + int(win.width * 0.55)
+        cy = win.top + int(win.height * 0.58)
+    else:
+        cx = win.left + int(win.width * 0.72)
+        cy = win.top + int(win.height * 0.55)
+    return cx, cy
+
+
+def scroll_composer_to_bottom(
+    win: CursorWindow,
+    *,
+    restore_focus: bool = True,
+    force: bool = False,
+) -> bool:
+    """把 Composer 聊天滚到最底, 让底部 Run/Fetch 等按钮进入截图可见区域。"""
+    if not is_composer_window(win.title):
+        return False
+
+    now = time.monotonic()
+    if not force and now - _last_composer_scroll.get(win.hwnd, 0) < _COMPOSER_SCROLL_COOLDOWN:
+        return False
+
+    import pyautogui
+
+    prev_hwnd = user32.GetForegroundWindow()
+    prev_mouse = pyautogui.position()
+
+    _force_foreground(win.hwnd)
+    time.sleep(0.1)
+
+    cx, cy = _composer_click_point(win)
+    pyautogui.click(cx, cy)
+    time.sleep(0.06)
+
+    pyautogui.hotkey("ctrl", "end")
+    time.sleep(0.08)
+    for _ in range(4):
+        pyautogui.press("end")
+        time.sleep(0.03)
+    pyautogui.moveTo(cx, cy)
+    for _ in range(8):
+        pyautogui.scroll(-600)
+        time.sleep(0.02)
+
+    _last_composer_scroll[win.hwnd] = now
+
+    if restore_focus and prev_hwnd and prev_hwnd != win.hwnd:
+        time.sleep(0.04)
+        _force_foreground(prev_hwnd)
+    try:
+        pyautogui.moveTo(prev_mouse.x, prev_mouse.y)
+    except Exception:
+        pass
+    return True
 
 
 def capture_window(hwnd: int, *, refresh_background: bool = True) -> np.ndarray | None:
