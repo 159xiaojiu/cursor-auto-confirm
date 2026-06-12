@@ -61,6 +61,7 @@ class HotkeyController:
     def toggle(self) -> None:
         self.enabled = not self.enabled
         state = "运行中" if self.enabled else "已暂停"
+        logging.getLogger("autopilot").info("热键切换: 自动点击 -> %s", state)
         print(f"[热键] 自动点击 -> {state}")
 
     def request_quit(self) -> None:

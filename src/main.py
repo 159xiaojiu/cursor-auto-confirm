@@ -131,10 +131,92 @@ class Orchestrator:
         self.activity = UserActivityMonitor(cfg.click.pause_on_user_activity_seconds)
         self.hotkeys = HotkeyController(cfg.hotkey)
         self.watchdog = ConversationWatchdog(self.detector, self.safety)
+        self._last_pause_log = 0.0
+        self._last_cooldown_log = 0.0
 
     @property
     def windows_mode(self) -> bool:
         return self.cfg.scan.mode.lower() == "windows"
+
+    def _log_pause_reasons(self) -> None:
+        now = time.monotonic()
+        if not self.hotkeys.enabled and now - self._last_pause_log > 60:
+            log.warning("自动点击已暂停 (Ctrl+Alt+A 恢复)")
+            self._last_pause_log = now
+        if self.safety.in_cooldown() and now - self._last_cooldown_log > 30:
+            log.warning(
+                "安全冷却中, 暂停点击 (剩余 %.0fs)",
+                self.safety.cooldown_remaining(),
+            )
+            self._last_cooldown_log = now
+
+    def _ocr_region(self, win, region_img, y_off: int, x_off: int):
+        from .capture import CaptureResult
+
+        cap = CaptureResult(
+            image=region_img,
+            offset_x=win.left + x_off,
+            offset_y=win.top + y_off,
+            scale=1.0,
+        )
+        cands, boxes = self.detector.detect(cap)
+        for c in cands:
+            c.hwnd = win.hwnd
+            c.safety_boxes = boxes
+        return cands, boxes
+
+    def _dedupe_candidates(self, all_cands: list) -> list:
+        seen: set[tuple] = set()
+        unique: list = []
+        for c in all_cands:
+            key = (c.label, c.screen_x // 24, c.screen_y // 24)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(c)
+        return unique
+
+    def _scan_window(self, win, *, force_refresh: bool = False):
+        from .windows import capture_window
+
+        refresh = force_refresh or win.title == "Cursor Agents"
+        img = capture_window(win.hwnd, refresh_background=refresh)
+        if img is None:
+            log.debug("窗口 '%s' 截图失败", win.title)
+            return [], []
+        regions = self._scan_regions(win, img)
+        if not regions:
+            return [], []
+
+        # 阶段1: 只扫最下方一段(多数 Run/Fetch 在这)
+        bottom = regions[-1]
+        cands, boxes = self._ocr_region(win, bottom[0], bottom[1], bottom[2])
+        if cands:
+            return self._dedupe_candidates(cands), boxes
+
+        # 阶段2: 全区域扫描(聊天区中段按钮)
+        all_cands: list = []
+        all_boxes: list = []
+        for region_img, y_off, x_off in regions:
+            cands, boxes = self._ocr_region(win, region_img, y_off, x_off)
+            all_cands.extend(cands)
+            all_boxes.extend(boxes)
+        return self._dedupe_candidates(all_cands), all_boxes
+
+    def retry_window(self, title: str) -> bool:
+        """巡检发现卡住时, 强制刷新指定窗口并重试点击。"""
+        from .windows import list_cursor_windows
+
+        clicked = False
+        for win in list_cursor_windows():
+            if win.title != title:
+                continue
+            candidates, boxes = self._scan_window(win, force_refresh=True)
+            for cand in candidates:
+                if self._handle_one(cand, boxes, win):
+                    clicked = True
+                    break
+        return clicked
 
     def scan_once(self):
         """返回 (candidates, all_boxes); windows 模式聚合所有 Cursor 窗口。"""
@@ -148,8 +230,7 @@ class Orchestrator:
         return candidates, all_boxes
 
     def _detect_windows(self):
-        from .capture import CaptureResult
-        from .windows import capture_window, list_cursor_windows
+        from .windows import list_cursor_windows
 
         def _win_priority(title: str) -> int:
             if title == "Cursor Agents":
@@ -162,43 +243,14 @@ class Orchestrator:
         wins = sorted(list_cursor_windows(), key=lambda w: _win_priority(w.title))
         for win in wins:
             if win.title == "Cursor":
-                continue  # Home 欢迎页无确认按钮, 跳过以提速
-            img = capture_window(
-                win.hwnd,
-                refresh_background=(win.title == "Cursor Agents"),
-            )
-            if img is None:
-                log.debug("窗口 '%s' 截图失败", win.title)
                 continue
-            regions = self._scan_regions(win, img)
-            all_cands: list = []
-            all_boxes: list = []
-            for region_img, y_off, x_off in regions:
-                cap = CaptureResult(
-                    image=region_img,
-                    offset_x=win.left + x_off,
-                    offset_y=win.top + y_off,
-                    scale=1.0,
-                )
-                cands, boxes = self.detector.detect(cap)
-                for c in cands:
-                    c.hwnd = win.hwnd
-                    c.safety_boxes = boxes
-                all_cands.extend(cands)
-                all_boxes.extend(boxes)
-            if all_cands:
-                log.debug("窗口 '%s' 发现 %d 个候选按钮", win.title, len(all_cands))
-            seen: set[tuple] = set()
-            unique: list = []
-            for c in all_cands:
-                key = (c.label, c.screen_x // 24, c.screen_y // 24)
-                if key in seen:
-                    continue
-                seen.add(key)
-                unique.append(c)
+            unique, all_boxes = self._scan_window(win)
+            if unique:
+                log.debug("窗口 '%s' 发现 %d 个候选按钮", win.title, len(unique))
             results.append((win, unique, all_boxes))
         if wins:
-            log.debug("本轮扫描 %d 个窗口: %s", len(wins), [w.title for w in wins])
+            titles = [w.title for w in wins if w.title != "Cursor"]
+            log.debug("本轮扫描 %d 个窗口(跳过Home): %s", len(titles), titles)
         return results
 
     @staticmethod
@@ -279,6 +331,7 @@ class Orchestrator:
                 start = time.monotonic()
                 window_results = None
                 try:
+                    self._log_pause_reasons()
                     if self.windows_mode:
                         window_results = self._detect_windows()
                         if self.hotkeys.enabled and not self.activity.is_user_active():
@@ -294,6 +347,8 @@ class Orchestrator:
                             window_results,
                             autopilot_enabled=self.hotkeys.enabled,
                             interval=wd.interval_seconds,
+                            retry_on_stuck=wd.retry_on_stuck,
+                            orchestrator=self,
                         )
                 except Exception:
                     log.exception("主循环单步异常")

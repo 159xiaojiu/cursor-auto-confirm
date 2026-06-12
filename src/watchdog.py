@@ -1,22 +1,25 @@
-"""对话窗口巡检: 周期性检查 Agent 是否在跑、是否有未点的确认按钮。"""
+"""对话窗口巡检: 周期性检查 Cursor 是否在跑、是否有未点的确认按钮。"""
 from __future__ import annotations
 
 import logging
 import re
 import time
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from .detector import ButtonCandidate, ButtonDetector, TextBox
 from .safety import SafetyGate
+from .windows import list_cursor_windows
+
+if TYPE_CHECKING:
+    from .main import Orchestrator
 
 log = logging.getLogger("autopilot.watchdog")
 
-# Agent 运行中的常见文案
 _RUNNING_HINTS = (
     "exploring", "generating", "thought", "planning", "working",
     "stop ctrl", "local", "cloud",
 )
-# 已完成一步/无待确认
 _DONE_HINTS = ("ran ", "ran\n", "completed", "finished", "done")
 
 
@@ -115,7 +118,6 @@ class ConversationWatchdog:
         *,
         autopilot_enabled: bool = True,
     ) -> list[WindowReport]:
-        """window_results: Orchestrator._detect_windows() 返回值。"""
         reports: list[WindowReport] = []
         for win, candidates, activity_boxes in window_results:
             if win.title == "Cursor":
@@ -125,10 +127,11 @@ class ConversationWatchdog:
                 sb = getattr(c, "safety_boxes", None)
                 if sb:
                     all_boxes.extend(sb)
-            report = self._classify(
-                win.title, candidates, all_boxes, autopilot_enabled=autopilot_enabled
+            reports.append(
+                self._classify(
+                    win.title, candidates, all_boxes, autopilot_enabled=autopilot_enabled
+                )
             )
-            reports.append(report)
         return reports
 
     def run_check(
@@ -136,42 +139,60 @@ class ConversationWatchdog:
         window_results: list[tuple],
         *,
         autopilot_enabled: bool = True,
-        interval: float = 300.0,
+        interval: float = 180.0,
+        retry_on_stuck: bool = True,
+        orchestrator: Orchestrator | None = None,
     ) -> list[WindowReport]:
         now = time.monotonic()
         if not self.due(interval, now):
             return []
         self._last_check = now
 
+        all_cursor = list_cursor_windows()
+        monitored = [w.title for w in all_cursor if w.title != "Cursor"]
+        skipped = [w.title for w in all_cursor if w.title == "Cursor"]
+        log.info(
+            "【巡检】Cursor 窗口共 %d 个 | 监控: %s | 跳过(Home欢迎页): %s",
+            len(all_cursor), monitored or "无", skipped or "无",
+        )
+
+        if not autopilot_enabled:
+            log.warning("【巡检】自动点击当前已暂停 (Ctrl+Alt+A 可恢复)")
+
+        if self.safety.in_cooldown():
+            log.warning(
+                "【巡检】安全冷却中, 暂停点击 (剩余 %.0fs)",
+                self.safety.cooldown_remaining(),
+            )
+
         reports = self.check_windows(
             window_results, autopilot_enabled=autopilot_enabled
         )
         if not reports:
-            log.info("【巡检】未发现 Agent 对话窗口(已跳过 Home 欢迎页)")
+            log.info("【巡检】无 Agent 对话窗口需要照看")
             return reports
 
         lines = ["【巡检】对话窗口状态 (每 %.0f 分钟)" % (interval / 60.0)]
+        stuck_titles: list[str] = []
         for r in reports:
             if r.state == "stuck_pending":
                 self._stuck_since.setdefault(r.title, now)
                 stuck_sec = int(now - self._stuck_since[r.title])
-                lines.append(
-                    f"  ⚠ {r.title}: 运行中/有待确认但未自动点击 "
+                stuck_titles.append(r.title)
+                msg = (
+                    f"  ⚠ {r.title}: 有待确认但未自动点击 "
                     f"按钮={r.pending} 已等待约{stuck_sec}s"
                 )
-                log.warning(
-                    "【巡检】'%s' 有待确认按钮 %s 但未自动点击(约 %ds)",
-                    r.title, r.pending, stuck_sec,
-                )
+                if r.block_reason:
+                    msg += f" ({r.block_reason})"
+                lines.append(msg)
+                log.warning("【巡检】'%s' 待点 %s 未自动点击(约 %ds)", r.title, r.pending, stuck_sec)
             elif r.state == "blocked":
                 self._stuck_since.setdefault(r.title, now)
                 lines.append(
                     f"  ⛔ {r.title}: 检测到 {r.pending} 但被安全拦截: {r.block_reason}"
                 )
-                log.warning(
-                    "【巡检】'%s' 待点 %s 被拦截: %s",
-                    r.title, r.pending, r.block_reason,
-                )
+                log.warning("【巡检】'%s' 待点 %s 被拦截: %s", r.title, r.pending, r.block_reason)
             elif r.state == "running_ok":
                 self._stuck_since.pop(r.title, None)
                 act = ", ".join(r.activity[:2]) if r.activity else "运行中"
@@ -183,6 +204,16 @@ class ConversationWatchdog:
                 self._stuck_since.pop(r.title, None)
                 lines.append(f"  · {r.title}: 空闲/无 Agent 任务")
 
-        summary = "\n".join(lines)
-        log.info(summary)
+        log.info("\n".join(lines))
+
+        if (
+            retry_on_stuck
+            and stuck_titles
+            and orchestrator is not None
+            and autopilot_enabled
+        ):
+            for title in stuck_titles:
+                log.info("【巡检】强制重扫并尝试点击: %s", title)
+                orchestrator.retry_window(title)
+
         return reports

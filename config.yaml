@@ -96,4 +96,5 @@ logging:
 
 watchdog:
   enabled: true
-  interval_seconds: 300    # 每 5 分钟巡检 Agent 对话窗口状态
+  interval_seconds: 180    # 每 3 分钟巡检 Cursor 窗口与待确认状态
+  retry_on_stuck: true     # 巡检发现「有待确认但未点」时强制刷新并重试

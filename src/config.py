@@ -68,7 +68,8 @@ class LoggingConfig:
 @dataclass
 class WatchdogConfig:
     enabled: bool = True
-    interval_seconds: float = 300.0   # 默认每 5 分钟巡检一次
+    interval_seconds: float = 180.0   # 默认每 3 分钟巡检一次
+    retry_on_stuck: bool = True       # 发现卡住时强制重扫+重试点击
 
 
 @dataclass

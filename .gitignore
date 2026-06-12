@@ -21,6 +21,8 @@ autopilot.pid
 tray.lock
 debug_*.png
 debug_*.ps1*
+debug_scan.py
+tools/_probe/
 
 # temp upload artifacts
 _push_*
