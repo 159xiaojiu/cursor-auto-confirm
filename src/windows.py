@@ -220,11 +220,43 @@ def scroll_composer_to_bottom(
     return True
 
 
+def get_foreground_hwnd() -> int:
+    return int(user32.GetForegroundWindow() or 0)
+
+
+def restore_foreground(hwnd: int) -> None:
+    if hwnd:
+        _force_foreground(hwnd)
+
+
+def activate_window_for_scan(win: CursorWindow, settle: float = 0.1) -> None:
+    """扫描前切到目标窗口, 确保后台多窗口也能截到最新画面。"""
+    if win32gui.IsIconic(win.hwnd):
+        user32.ShowWindow(win.hwnd, SW_RESTORE)
+        time.sleep(0.1)
+    _force_foreground(win.hwnd)
+    time.sleep(settle)
+
+
+def agents_sidebar_chat_points(win: CursorWindow, rows: int = 4) -> list[tuple[int, int]]:
+    """Cursor Agents 左侧会话列表, 从上到下依次点(覆盖近期对话)。"""
+    x = win.left + int(win.width * 0.08)
+    y0 = win.top + 165
+    step = max(52, int(win.height * 0.065))
+    return [(x, y0 + i * step) for i in range(rows)]
+
+
 def capture_window(hwnd: int, *, refresh_background: bool = True) -> np.ndarray | None:
-    """抓取窗口画面; 仅当 PrintWindow 失败时才短暂激活后台窗口。"""
+    """抓取窗口画面; 目标窗口已是前台时直接截, 否则尝试 PrintWindow / 短暂激活。"""
     if win32gui.IsIconic(hwnd):
         user32.ShowWindow(hwnd, SW_RESTORE)
         time.sleep(0.12)
+
+    fg = user32.GetForegroundWindow()
+    if fg == hwnd:
+        img = _capture_printwindow(hwnd)
+        if img is not None and _is_good_capture(img):
+            return img
 
     img = _capture_printwindow(hwnd)
     if img is not None and _is_good_capture(img):
@@ -235,11 +267,7 @@ def capture_window(hwnd: int, *, refresh_background: bool = True) -> np.ndarray 
 
     now = time.monotonic()
     last = _last_foreground_refresh.get(hwnd, 0.0)
-    if now - last < _FOREGROUND_REFRESH_COOLDOWN:
-        return img
-
-    fg = user32.GetForegroundWindow()
-    if hwnd == fg:
+    if now - last < _FOREGROUND_REFRESH_COOLDOWN and fg != hwnd:
         return img
 
     prev = fg

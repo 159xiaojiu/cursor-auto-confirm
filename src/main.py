@@ -133,6 +133,34 @@ class Orchestrator:
         self.watchdog = ConversationWatchdog(self.detector, self.safety)
         self._last_pause_log = 0.0
         self._last_cooldown_log = 0.0
+        self._win_activity: dict[str, float] = {}
+        self._scan_round = 0
+
+    def _touch_window_activity(self, title: str, candidates: list, boxes: list) -> None:
+        if candidates:
+            self._win_activity[title] = time.monotonic()
+            return
+        hints = ("exploring", "generating", "stop", "thought", "ran ", "%")
+        for b in boxes:
+            t = (getattr(b, "text", "") or "").lower()
+            if any(h in t for h in hints):
+                self._win_activity[title] = time.monotonic()
+                return
+
+    def _sort_windows(self, wins: list) -> list:
+        """近期有 Agent 活动的窗口优先, Home/Agents 仍靠前。"""
+
+        def score(w) -> tuple:
+            if w.title == "Cursor Agents":
+                tier = 0
+            elif w.title.endswith(" - Cursor"):
+                tier = 1
+            else:
+                tier = 2
+            last = self._win_activity.get(w.title, 0.0)
+            return (tier, -last)
+
+        return sorted(wins, key=score)
 
     @property
     def windows_mode(self) -> bool:
@@ -176,30 +204,52 @@ class Orchestrator:
             unique.append(c)
         return unique
 
-    def _scan_window(self, win, *, force_refresh: bool = False):
-        from .windows import capture_window, is_composer_window, scroll_composer_to_bottom
+    def _scan_window(self, win, *, force_refresh: bool = False, restore_focus: bool = True):
+        from .windows import (
+            activate_window_for_scan,
+            agents_sidebar_chat_points,
+            capture_window,
+            is_composer_window,
+            scroll_composer_to_bottom,
+        )
 
-        if is_composer_window(win.title):
-            scroll_composer_to_bottom(win, force=force_refresh)
+        activate_window_for_scan(win)
 
-        refresh = force_refresh or win.title == "Cursor Agents"
-        img = capture_window(win.hwnd, refresh_background=refresh)
-        if img is None:
-            log.debug("窗口 '%s' 截图失败", win.title)
-            return [], []
+        def _run_scan() -> tuple[list, list]:
+            if is_composer_window(win.title):
+                scroll_composer_to_bottom(
+                    win, force=force_refresh, restore_focus=False,
+                )
+            img = capture_window(win.hwnd, refresh_background=True)
+            if img is None:
+                return [], []
+            return self._scan_image_regions(win, img)
 
-        cands, boxes = self._scan_image_regions(win, img)
+        cands, boxes = _run_scan()
         if cands or not is_composer_window(win.title):
             return cands, boxes
 
-        # 未找到按钮且聊天可能未滚到底: 强制滚到底后重扫一次
-        log.debug("窗口 '%s' 未发现按钮, 强制滚到底后重试", win.title)
-        scroll_composer_to_bottom(win, force=True)
-        time.sleep(0.15)
-        img2 = capture_window(win.hwnd, refresh_background=True)
-        if img2 is None:
+        scroll_composer_to_bottom(win, force=True, restore_focus=False)
+        time.sleep(0.12)
+        cands, boxes = _run_scan()
+        if cands or win.title != "Cursor Agents":
             return cands, boxes
-        return self._scan_image_regions(win, img2)
+
+        # Home/Agents: 轮换左侧近期会话, 避免只扫当前选中的一条对话
+        import pyautogui
+
+        merged_cands: list = []
+        merged_boxes: list = []
+        for sx, sy in agents_sidebar_chat_points(win):
+            pyautogui.click(sx, sy)
+            time.sleep(0.22)
+            scroll_composer_to_bottom(win, force=True, restore_focus=False)
+            time.sleep(0.1)
+            sub_cands, sub_boxes = _run_scan()
+            merged_cands.extend(sub_cands)
+            merged_boxes.extend(sub_boxes)
+
+        return self._dedupe_candidates(merged_cands), merged_boxes
 
     def _scan_image_regions(self, win, img):
         regions = self._scan_regions(win, img)
@@ -227,7 +277,7 @@ class Orchestrator:
         for win in list_cursor_windows():
             if win.title != title:
                 continue
-            candidates, boxes = self._scan_window(win, force_refresh=True)
+            candidates, boxes = self._scan_window(win, force_refresh=True, restore_focus=False)
             for cand in candidates:
                 if self._handle_one(cand, boxes, win):
                     clicked = True
@@ -246,27 +296,30 @@ class Orchestrator:
         return candidates, all_boxes
 
     def _detect_windows(self):
-        from .windows import list_cursor_windows
+        from .windows import get_foreground_hwnd, list_cursor_windows, restore_foreground
 
-        def _win_priority(title: str) -> int:
-            if title == "Cursor Agents":
-                return 0
-            if title.endswith(" - Cursor"):
-                return 1
-            return 2
-
+        prev_hwnd = get_foreground_hwnd()
         results = []
-        wins = sorted(list_cursor_windows(), key=lambda w: _win_priority(w.title))
-        for win in wins:
-            if win.title == "Cursor":
-                continue
-            unique, all_boxes = self._scan_window(win)
-            if unique:
-                log.debug("窗口 '%s' 发现 %d 个候选按钮", win.title, len(unique))
-            results.append((win, unique, all_boxes))
-        if wins:
-            titles = [w.title for w in wins if w.title != "Cursor"]
-            log.debug("本轮扫描 %d 个窗口(跳过Home): %s", len(titles), titles)
+        try:
+            wins = self._sort_windows(list_cursor_windows())
+            self._scan_round += 1
+            for win in wins:
+                if win.title == "Cursor":
+                    continue
+                unique, all_boxes = self._scan_window(
+                    win, force_refresh=(win.title == "Cursor Agents"),
+                    restore_focus=False,
+                )
+                self._touch_window_activity(win.title, unique, all_boxes)
+                if unique:
+                    log.debug("窗口 '%s' 发现 %d 个候选按钮", win.title, len(unique))
+                results.append((win, unique, all_boxes))
+            if wins:
+                titles = [w.title for w in wins if w.title != "Cursor"]
+                log.debug("第 %d 轮 | 逐窗切换扫描: %s", self._scan_round, titles)
+        finally:
+            if prev_hwnd:
+                restore_foreground(prev_hwnd)
         return results
 
     @staticmethod
@@ -312,6 +365,8 @@ class Orchestrator:
             else:
                 self.clicker.click(cand.screen_x, cand.screen_y)
             self.safety.record_click(cand)
+            if win is not None:
+                self._win_activity[win.title] = time.monotonic()
             log.info("点击 '%s'%s (%d,%d) score=%.2f",
                      cand.label, where, cand.screen_x, cand.screen_y, cand.box.score)
         return True
